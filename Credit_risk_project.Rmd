@@ -31,6 +31,7 @@ require(ggcorrplot) # for correlation plots
 require(kableExtra) # for presenting model output
 require(glmnet) # for lasso regression
 require(ranger) # for random forest
+require(kernlab) # for support vector machines
 
 
 theme_set(theme_bw() +
@@ -452,7 +453,7 @@ df_bin <-
   df_bin %>%
   select(-bin.1)
 
-
+rm(p,bins)
 ```
 
 
@@ -509,7 +510,7 @@ test <- testing(split)
 - Preprocessing steps to be added:
   1. **update** the role of ID_var to ID so it would not be taken into account when modeling
   2. transform all the bins into **dummy** variables: having either 1 or 0 as value
-  3. address the fact that indivuals that have defaulted are underrepresented:
+  3. address the fact that individuals that have defaulted are underrepresented:
   
 
 ```{r, fig.height= 3,fig.width=5,fig.align='center'}
@@ -523,16 +524,18 @@ To correct this I will oversample those who defaulted to create a balanced datas
 
 ```{r}
 
-# m = glm(Default ~ ., family = binomial(), data = train)
-# card = scorecard(bins, m)
-# prob = predict(m, train, type='response')
 
 formula1 = paste(names(train)[c(1,3:12)],collapse = " + ")
 
-default_rec1 <- recipe(data = train,formula = paste0("Default ~ ",formula1,sep = "")) %>%
+default_rec1 <- 
+  recipe(data = train,formula = paste0("Default ~ ",formula1,sep = "")) %>%
   update_role(ID_var, new_role = "ID") %>%
-  step_dummy(all_predictors(),one_hot = TRUE) %>%
-  step_upsample(Default, over_ratio = 1)
+  step_dummy(all_predictors(),one_hot = TRUE) 
+
+  # step_smote(Default)
+
+  # step_upsample(Default, over_ratio = 1)
+
 
 ```
 
@@ -580,9 +583,11 @@ metric_df <-
 metric_df %>%
   kbl() %>%
   kable_classic_2(full_width = F)
+
+rm(glm_model)
 ```
 
-Our initial model has an **accuracy** score of 0.797 and and **roc_auc** score of 0.843
+Our initial model has an **accuracy** score of 0.933 and and **roc_auc** score of 0.843
 
 
 ## Logistic Model 2: Simple model, all features
@@ -593,8 +598,11 @@ In the first model I will try to explain the default rate using all the variable
 
 default_rec2 <- recipe(data = train, Default ~ .) %>%
   update_role(ID_var, new_role = "ID") %>%
-  step_dummy(all_predictors(),one_hot = TRUE) %>%
-  step_upsample(Default, over_ratio = 1)
+  step_dummy(all_predictors(),one_hot = TRUE)
+
+  # step_smote(Default)
+
+  # step_upsample(Default, over_ratio = 1)
 
 glm_model <- 
   workflow() %>% 
@@ -607,13 +615,13 @@ glm_model %>%
   kbl() %>%
   kable_classic_2(full_width = F)
 
-glm_pred <-
+glm2_pred <-
   bind_cols(
     test[,"Default"],
     predict(glm_model,test),
     predict(glm_model,test,type = "prob"))
 
-glm_pred %>% 
+glm2_pred %>% 
   conf_mat(Default, .pred_class) %>%
   autoplot(type = "heatmap")
 
@@ -621,8 +629,8 @@ roc_curve(glm_pred, truth = Default, estimate = .pred_0) %>% autoplot()
 
 metric_df <-
   bind_rows(bind_rows(
-    accuracy(glm_pred,Default,.pred_class),
-    roc_auc(glm_pred,Default,.pred_0)) %>%
+    accuracy(glm_pred2,Default,.pred_class),
+    roc_auc(glm_pred2,Default,.pred_0)) %>%
   mutate(model = "Simple LR - All"),
   metric_df)
 
@@ -632,8 +640,12 @@ metric_df %>%
   kbl() %>%
   kable_classic_2(full_width = F)
 
+rm(glm_model,glm_spec)
+
 ```
 
+
+The model with all the features is slightly better then the base model
 
 ## Penalized regression 
 
@@ -642,7 +654,7 @@ metric_df %>%
 
 ```{r, eval=TRUE}
 # Creating folds for cross validation
-train_fold <- train %>% vfold_cv(5,strata = Default)
+train_fold <- train %>% vfold_cv(3,strata = Default)
 
 # Declaring the model we will use
 lasso_spec <- logistic_reg(penalty = tune()) %>%
@@ -655,11 +667,12 @@ lasso_model <-
   add_model(lasso_spec)
 
 # Creating the specification for our tune grid
-lambda_grid <- crossing(penalty = 10 ^ seq(-7,-0.5,0.1))
+lambda_grid <- crossing(penalty = 10 ^ seq(-7,-0.5,0.25))
 
 lasso_grid <- tune_grid(lasso_model
                         ,resamples = train_fold,
                         grid = lambda_grid,
+                        control = control_grid(verbose = TRUE)
                         )
 
 highest_acc <- lasso_grid %>% 
@@ -722,17 +735,18 @@ metric_df <-
   bind_rows(bind_rows(
     accuracy(lasso_pred,Default,.pred_class),
     roc_auc(lasso_pred,Default,.pred_0)) %>%
-  mutate(model = "Lasso"),
+  mutate(model = "Lasso Regression"),
   metric_df)
 
 metric_df %>%
-  filter(model == "Lasso") %>%
+  filter(model == "Lasso Regression") %>%
   kbl() %>%
   kable_classic_2(full_width = F)
+
+rm(lasso_model,lasso_grid,lasso_spec)
 ```
 
-The lasso model performs worse then the simple logistic model
-
+The lasso model performs a little better then the full logistic regression model.
 
 
 ## Random forest
@@ -749,7 +763,7 @@ rf_spec <- rand_forest(
 
 
 rf_grid <-
-  crossing(mtry = c(9:15),min_n = c(seq(1,25,5)),trees = c(500,1000))
+  crossing(mtry = c(3,4),min_n = c(5,100,200),trees = c(8,16))
 
 
 rf_model <- 
@@ -765,8 +779,48 @@ rf_tune <- tune_grid(rf_model,
           )
 highest_acc <- rf_tune %>% select_best("roc_auc")
 
-rf_tune %>% autoplot()
+
 rf_tune %>% collect_metrics() %>% arrange(-mean)
+
+
+rf_model <- finalize_workflow(rf_model,
+                  highest_acc) %>% fit(data = train)
+
+rf_model %>%
+  pull_workflow_fit()
+
+rf_pred <-
+  bind_cols(
+    test[,"Default"],
+    predict(rf_model,test),
+    predict(rf_model,test,type = "prob"))
+
+rf_pred %>% 
+  conf_mat(Default, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+roc_curve(rf_pred, truth = Default, estimate = .pred_0) %>% autoplot()
+
+metric_df <-
+  bind_rows(bind_rows(
+    accuracy(rf_pred,Default,.pred_class),
+    roc_auc(rf_pred,Default,.pred_0)) %>%
+  mutate(model = "Random Forest"),
+  metric_df)
+
+metric_df %>%
+  filter(model == "Random Forest") %>%
+  kbl() %>%
+  kable_classic_2(full_width = F)
+
+```
+
+The **random forest** algorithm does not outperforms the penalized regression model
+
+## Model selection and 
+
+```{r}
+
 ```
 
 
